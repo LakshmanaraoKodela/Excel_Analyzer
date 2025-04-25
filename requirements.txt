@@ -1,0 +1,12 @@
+streamlit
+pandas
+plotly
+google-generativeai
+python-dotenv
+langchain
+langchain-community
+faiss-cpu
+transformers
+sentence-transformers
+scikit-learn
+numpy
