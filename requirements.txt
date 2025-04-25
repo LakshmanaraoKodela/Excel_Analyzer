@@ -1,12 +1,25 @@
+# Core libraries
 streamlit
 pandas
-plotly
-google-generativeai
+numpy
+datetime
 python-dotenv
+
+# Google Generative AI
+google-generativeai
 langchain
+langchain-google-genai
 langchain-community
-faiss-cpu
+
+# Plotting
+plotly
+
+# Machine Learning
+scikit-learn
+
+# Hugging Face Embeddings (via Langchain)
 transformers
 sentence-transformers
-scikit-learn
-numpy
+
+# FAISS (Vector Search)
+faiss-cpu
