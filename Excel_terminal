@@ -1,0 +1,714 @@
+import os
+import sys
+import logging
+import datetime
+import json
+import traceback
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
+from typing import Dict, List, Optional, Any
+from tabulate import tabulate
+import re
+
+# LangChain imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+
+
+class JSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder to handle NumPy and pandas types"""
+
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.floating)):
+            return int(obj) if isinstance(obj, np.integer) else float(obj)
+        if isinstance(obj, (pd.Series, np.ndarray)):
+            return obj.tolist()
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        if hasattr(obj, 'dtype'):
+            return obj.item()
+        return json.JSONEncoder.default(self, obj)
+
+
+class ViewOnlyDataQueryEngine:
+    def __init__(self, api_key: str, file_path: str, model_name: str = "gemini-1.5-flash"):
+        """
+        Initialize the View-Only Data Query Engine with focus on read-only SQL-like query capabilities
+
+        Args:
+            api_key (str): Google AI API key
+            file_path (str): Path to the Excel or CSV file
+            model_name (str): Google AI model to use
+        """
+        self.api_key = api_key
+        self.file_path = file_path
+        self.model_name = model_name
+        self.df = None
+        self.file_extension = os.path.splitext(file_path)[1].lower()
+
+        # Setup logging
+        self.logger = self._setup_logging()
+
+        # AI components
+        self.llm = None
+
+        # Schema and data analysis
+        self.schema_analysis = None
+
+    def _setup_logging(self):
+        """Configure minimal logging for the application"""
+        logger = logging.getLogger('ViewOnlyDataQueryEngine')
+        logger.setLevel(logging.INFO)
+
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_format = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_format)
+
+        logger.addHandler(console_handler)
+        return logger
+
+    def initialize(self):
+        """Initialize the query engine with data loading and schema analysis"""
+        try:
+            # Load data
+            self._load_data()
+
+            # Initialize AI component
+            self._initialize_llm()
+
+            # Analyze schema
+            self._analyze_schema()
+
+            self.logger.info("View-Only Data Query Engine initialized successfully")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Initialization failed: {e}")
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def _load_data(self):
+        """Load the complete dataset with optimized settings"""
+        try:
+            # Select appropriate loading method based on file type
+            if self.file_extension in ['.xlsx', '.xls']:
+                self.df = pd.read_excel(self.file_path, engine='openpyxl')
+            elif self.file_extension == '.csv':
+                # Try to infer data types for better performance
+                self.df = pd.read_csv(
+                    self.file_path,
+                    low_memory=False,
+                    dtype_backend='numpy_nullable'  # Use nullable dtypes for better type inference
+                )
+            else:
+                raise ValueError(f"Unsupported file format: {self.file_extension}")
+
+            # Clean column names for easier reference
+            self.df.columns = [str(col).strip().lower().replace(' ', '_') for col in self.df.columns]
+
+            # Optimize memory usage by converting types where possible
+            for col in self.df.columns:
+                # Try to convert object columns to more efficient types
+                if self.df[col].dtype == 'object':
+                    # Try datetime conversion
+                    try:
+                        self.df[col] = pd.to_datetime(self.df[col], errors='ignore')
+                    except:
+                        pass
+
+                    # Try categorical conversion for columns with low cardinality
+                    if self.df[col].dtype == 'object':
+                        if self.df[col].nunique() < 0.5 * len(self.df):  # If fewer than 50% of values are unique
+                            self.df[col] = self.df[col].astype('category')
+
+            self.logger.info(f"Data loaded: {self.df.shape[0]} rows, {self.df.shape[1]} columns")
+
+        except Exception as e:
+            self.logger.error(f"Data loading error: {e}")
+            raise
+
+    def _initialize_llm(self):
+        """Initialize the language model with settings for code generation"""
+        try:
+            # Initialize LLM with minimal streaming (just for query execution)
+            self.llm = ChatGoogleGenerativeAI(
+                model=self.model_name,
+                temperature=0.1,  # Lower temperature for more deterministic code generation
+                google_api_key=self.api_key,
+                top_p=0.95,
+                # max_output_tokens=8192
+            )
+
+            self.logger.info("Language model initialized")
+
+        except Exception as e:
+            self.logger.error(f"LLM initialization error: {e}")
+            raise
+
+    def _preprocess_query(self, query):
+        """
+        Preprocess the query to correct potential spelling errors by referencing the actual dataset
+        and column names.
+        """
+        try:
+            # Extract all potential column-related terms from the dataset
+            vocabulary = set()
+
+            # Add column names to vocabulary
+            for col in self.df.columns:
+                # Add the column name and variations
+                vocabulary.add(col.lower())
+                # Add without underscores (if any)
+                if '_' in col:
+                    vocabulary.add(col.lower().replace('_', ' '))
+
+            # Add categorical values from the dataset (for columns with reasonable cardinality)
+            for col in self.schema_analysis['columns']:
+                if col.get('is_categorical', False) and col.get('unique_count', 0) < 100:
+                    # Add common values from categorical columns
+                    if 'top_values' in col:
+                        for value in col['top_values'].keys():
+                            if isinstance(value, str):
+                                vocabulary.add(value.lower())
+
+            # Use LLM to correct the query based on dataset context
+            correction_prompt = f"""
+            You are a natural language correction system for database queries.
+
+            TASK: Correct any spelling errors in the following query by comparing words to the dataset vocabulary.
+            The correction should maintain the original intent of the query.
+
+            QUERY: "{query}"
+
+            DATASET VOCABULARY (potential terms referenced in queries):
+            {', '.join(sorted(vocabulary))}
+
+            INSTRUCTIONS:
+            1. Only correct words that appear to be misspellings of terms in the vocabulary
+            2. Leave proper nouns, numbers, and other terms not in the vocabulary unchanged
+            3. Do not add or remove words from the query
+            4. Do not change the query's structure or intent
+            5. Return only the corrected query with no explanations
+            6. If no corrections are needed, return the original query unchanged
+
+            CORRECTED QUERY:
+            """
+
+            # Use a low temperature for deterministic corrections
+            correction_response = self.llm.invoke(
+                correction_prompt,
+
+            )
+
+            corrected_query = correction_response.content.strip()
+
+            # Log if corrections were made
+            if corrected_query != query:
+                self.logger.info(f"Corrected query: '{query}' to '{corrected_query}'")
+
+            return corrected_query
+
+        except Exception as e:
+            self.logger.warning(f"Query preprocessing error: {e}, using original query")
+            return query  # Fallback to original query
+
+    def _analyze_schema(self):
+        """Detailed schema analysis of the entire dataset"""
+        try:
+            # Schema level information
+            total_memory = self.df.memory_usage(deep=True).sum()
+
+            # Detailed column analysis
+            columns = []
+            for col in self.df.columns:
+                column_info = {
+                    'name': col,
+                    'dtype': str(self.df[col].dtype),
+                    'non_null_count': int(self.df[col].count()),
+                    'null_count': int(self.df[col].isna().sum()),
+                    'null_percentage': round(self.df[col].isna().mean() * 100, 2),
+                    'unique_count': int(self.df[col].nunique()),
+                    'unique_percentage': round(self.df[col].nunique() / len(self.df) * 100, 2),
+                    'memory_usage': int(self.df[col].memory_usage(deep=True)),
+                    'memory_percentage': round(self.df[col].memory_usage(deep=True) / total_memory * 100, 2)
+                }
+
+                # Data type specific analysis
+                if pd.api.types.is_numeric_dtype(self.df[col]):
+                    column_info.update({
+                        'min': float(self.df[col].min()) if not pd.isna(self.df[col].min()) else None,
+                        'max': float(self.df[col].max()) if not pd.isna(self.df[col].max()) else None,
+                        'mean': float(self.df[col].mean()) if not pd.isna(self.df[col].mean()) else None,
+                        'median': float(self.df[col].median()) if not pd.isna(self.df[col].median()) else None,
+                        'std': float(self.df[col].std()) if not pd.isna(self.df[col].std()) else None,
+                        'is_integer': bool(pd.api.types.is_integer_dtype(self.df[col])),
+                        'has_outliers': bool(self.df[col].nunique() > 0 and
+                                             self.df[col].max() > self.df[col].mean() + 3 * self.df[col].std())
+                    })
+
+                elif pd.api.types.is_datetime64_dtype(self.df[col]):
+                    column_info.update({
+                        'min': self.df[col].min().strftime('%Y-%m-%d %H:%M:%S') if not pd.isna(
+                            self.df[col].min()) else None,
+                        'max': self.df[col].max().strftime('%Y-%m-%d %H:%M:%S') if not pd.isna(
+                            self.df[col].max()) else None,
+                        'is_date': True
+                    })
+
+                elif pd.api.types.is_categorical_dtype(self.df[col]) or pd.api.types.is_object_dtype(self.df[col]):
+                    # Get top values for categorical data
+                    if self.df[col].nunique() <= 20:
+                        value_counts = self.df[col].value_counts().head(10).to_dict()
+                        column_info['top_values'] = value_counts
+
+                    column_info['is_categorical'] = True
+
+                columns.append(column_info)
+
+            # Save the schema analysis
+            self.schema_analysis = {
+                'dataset': {
+                    'rows': int(len(self.df)),
+                    'columns': int(len(self.df.columns)),
+                    'memory_usage': int(total_memory),
+                    'memory_usage_formatted': f"{total_memory / (1024 * 1024):.2f} MB" if total_memory > 1024 * 1024 else f"{total_memory / 1024:.2f} KB",
+                    'file_path': self.file_path,
+                    'file_name': os.path.basename(self.file_path),
+                    'file_size': os.path.getsize(self.file_path),
+                    'file_size_formatted': f"{os.path.getsize(self.file_path) / (1024 * 1024):.2f} MB"
+                },
+                'columns': columns
+            }
+
+            self.logger.info(f"Schema analysis completed with {len(columns)} columns")
+
+        except Exception as e:
+            self.logger.error(f"Schema analysis error: {e}")
+            raise
+
+    def _generate_pandas_code(self, query):
+        """Generate executable pandas code from natural language query (view-only)"""
+        try:
+            # Preprocess the query to correct spelling errors based on the dataset
+            corrected_query = self._preprocess_query(query)
+
+            # Create a compact schema representation
+            compact_schema = []
+            for col in self.schema_analysis['columns']:
+                col_info = f"{col['name']} ({col['dtype']}): "
+                col_info += f"non-null={col['non_null_count']}, unique={col['unique_count']}"
+
+                if 'min' in col and col['min'] is not None and 'max' in col and col['max'] is not None:
+                    col_info += f", range=[{col['min']}, {col['max']}]"
+
+                compact_schema.append(col_info)
+
+            # Prepare a sample of data (first few rows)
+            sample_data = self.df.head(3).to_dict(orient='records')
+            sample_str = json.dumps(sample_data, cls=JSONEncoder)
+
+            # Create a comprehensive prompt for code generation
+            code_gen_prompt = f"""
+            You are an expert data analyst who translates natural language into pandas code.
+
+            TASK: Generate Python code using pandas that functions like a READ-ONLY SQL query to answer: "{corrected_query}"
+
+            DATASET INFORMATION:
+            - {self.schema_analysis['dataset']['rows']} rows, {self.schema_analysis['dataset']['columns']} columns
+            - Columns: 
+            {chr(10).join(compact_schema)}
+
+            - Sample data (first 3 rows):
+            {sample_str}
+
+            REQUIREMENTS:
+            1. Generate ONLY EXECUTABLE Python code using pandas to process the dataframe 'df'
+            2. Return JUST the code block with NO explanations or markdown formatting
+            3. The code should:
+               - Be READ-ONLY - do not modify the original dataframe or create files
+               - Use ONLY the 'df' variable as input (do NOT import pandas or other libraries)
+               - Return a DataFrame object as the final result
+               - Include any necessary data filtering, grouping, sorting, etc.
+               - Be efficient when dealing with large datasets
+               - Handle potential missing values, case sensitivity, and spelling variations
+               - Use appropriate pandas functions for the operations
+            4. The result must be formatted as a COMPLETE dataframe without any print statements
+            5. For aggregation/grouping, show summary statistics in separate columns
+            6. If the question is ambiguous, make a reasonable assumption and proceed
+            7. Include clear column names in the result
+            8. DO NOT LIMIT the number of rows in the result - return ALL matching rows
+            9. If the query mentions a term that doesn't match column names exactly, use fuzzy matching
+               to find the closest column name
+            10. FORBIDDEN: Do not use any functions that modify data (insert, update, delete, to_csv, etc.)
+            11. DO NOT use any of these forbidden operations: to_csv, to_excel, df=, df['col']=, drop(), insert(), replace(), update()
+            12. DO NOT comment out your code with # at the beginning of lines
+
+            CODE:
+            """
+
+            # Get code from LLM
+            code_response = self.llm.invoke(code_gen_prompt)
+            code_to_execute = code_response.content.strip()
+
+            # Extract code if it's wrapped in code blocks
+            if "```python" in code_to_execute:
+                code_to_execute = code_to_execute.split("```python")[1].split("```")[0].strip()
+            elif "```" in code_to_execute:
+                code_to_execute = code_to_execute.split("```")[1].split("```")[0].strip()
+
+            # Remove any import statements that may have been generated
+            code_to_execute = re.sub(r'import\s+[^;]+;?', '', code_to_execute)
+            code_to_execute = re.sub(r'from\s+[^;]+;?', '', code_to_execute)
+
+            # Remove any print statements
+            code_to_execute = re.sub(r'print\([^)]*\)', '', code_to_execute)
+
+            # Check for and remove any data modification functions
+            for forbidden_pattern in [
+                r'\.to_csv', r'\.to_excel', r'\.to_sql', r'\.to_pickle', r'\.to_hdf', r'\.to_feather',
+                r'\.to_parquet', r'\.to_json', r'\.to_html', r'\.to_latex', r'\.to_stata', r'\.to_gbq',
+                r'\.to_records', r'\.to_string', r'\.to_clipboard'
+            ]:
+                # Remove these operations completely
+                if re.search(forbidden_pattern, code_to_execute):
+                    self.logger.warning(f"Removing forbidden operation: {forbidden_pattern}")
+                    code_to_execute = re.sub(f"{forbidden_pattern}.*?[,)]", "", code_to_execute)
+
+            # Handle assignment operations separately to avoid commenting out the entire line
+            for assignment_pattern in [r'df\s*=\s', r'df\[\s*[\'\"]?\w+[\'\"]?\s*\]\s*=\s']:
+                if re.search(assignment_pattern, code_to_execute):
+                    self.logger.warning(f"Removing assignment operation: {assignment_pattern}")
+                    # Replace the assignment with a dummy no-op that doesn't affect the original df
+                    code_to_execute = re.sub(f"(.*?)({assignment_pattern})(.*)",
+                                             r"# \1\2\3  # Assignment removed for safety", code_to_execute)
+
+            # Remove any head/tail limits that might have been generated
+            # code_to_execute = re.sub(r'\.head\(\d*\)', '', code_to_execute)
+            # code_to_execute = re.sub(r'\.tail\(\d*\)', '', code_to_execute)
+
+            # Fix common code generation issues
+            # 1. Add result assignment if missing
+            if not re.search(r'result\s*=', code_to_execute):
+                # Find the last statement that likely produces a DataFrame
+                lines = code_to_execute.strip().split('\n')
+                last_line = lines[-1].strip()
+
+                # Remove the last line and add it back with result assignment
+                if lines and last_line:
+                    lines = lines[:-1]
+                    lines.append(f"result = {last_line}")
+                    code_to_execute = '\n'.join(lines)
+                else:
+                    # Fallback: just wrap everything in a result assignment
+                    code_to_execute = f"result = {code_to_execute}"
+
+            # Final validation: make sure the code has a result variable
+            if not re.search(r'result\s*=', code_to_execute):
+                raise ValueError("Generated code does not produce a result variable")
+
+            return code_to_execute
+
+        except Exception as e:
+            self.logger.error(f"Code generation error: {e}")
+            raise
+
+    def _attempt_code_fix(self, code):
+        """Try to fix common syntax errors in the generated code"""
+        # Remove any accidental import statements at the beginning of expressions
+        fixed_code = re.sub(r'result\s*=\s*import', 'result = ', code)
+
+        # Fix missing parentheses in function calls
+        fixed_code = re.sub(r'\.head\s+(\d+)', r'.head(\1)', fixed_code)
+        fixed_code = re.sub(r'\.tail\s+(\d+)', r'.tail(\1)', fixed_code)
+
+        # Fix incorrect column references by adding quotes for string literals
+        column_pattern = r'df\[([\w]+)\]'
+        column_matches = re.findall(column_pattern, fixed_code)
+        for col in column_matches:
+            if col not in ['True', 'False', 'None'] and not col.isdigit():
+                # Check if this is a variable name or a column reference
+                if col not in self.df.columns:
+                    # It might be a string that needs quotes
+                    fixed_code = fixed_code.replace(f'df[{col}]', f"df['{col}']")
+
+        return fixed_code
+
+    def _execute_query(self, code):
+        """Execute the generated pandas code against the dataframe"""
+        try:
+            # Create a safe local environment with the dataframe
+            # Make a copy of the dataframe to prevent any modifications
+            local_env = {'df': self.df.copy(), 'pd': pd, 'np': np}
+
+            # Execute the code
+            exec_result = {'result': None}  # Initialize with a default result
+
+            try:
+                exec(code, local_env, exec_result)
+
+                # Verify result is a DataFrame
+                if 'result' not in exec_result or not isinstance(exec_result['result'], pd.DataFrame):
+                    raise ValueError("Query did not produce a valid DataFrame result")
+
+                return exec_result['result']
+
+            except SyntaxError as se:
+                # Try to fix common syntax errors and retry
+                fixed_code = self._attempt_code_fix(code)
+                if fixed_code != code:
+                    self.logger.info(f"Attempting to execute fixed code: {fixed_code}")
+                    exec(fixed_code, local_env, exec_result)
+
+                    if 'result' in exec_result and isinstance(exec_result['result'], pd.DataFrame):
+                        return exec_result['result']
+                    else:
+                        raise ValueError("Fixed code did not produce a valid DataFrame result")
+                else:
+                    raise  # Re-raise if no fixes were applied
+
+        except Exception as e:
+            self.logger.error(f"Query execution error: {e}")
+            self.logger.error(f"Code that failed: {code}")
+
+            # Return error as DataFrame for consistent output
+            error_df = pd.DataFrame({
+                "Error Type": [type(e).__name__],
+                "Error Message": [str(e)],
+                "Code": [code]
+            })
+            return error_df
+
+    def _format_result_as_table(self, result_df):
+        """Format the result DataFrame as a tabular output similar to SQL"""
+        try:
+            # Get shape information
+            num_rows, num_cols = result_df.shape
+
+            # Format as markdown table
+            table = tabulate(result_df, headers='keys', tablefmt='pipe', showindex=False)
+
+            # Add result metadata without suggesting truncation
+            footer = f"\n\n[{num_rows} rows × {num_cols} columns]"
+            return table + footer
+
+        except Exception as e:
+            self.logger.error(f"Result formatting error: {e}")
+            return str(result_df)
+
+    def _generate_improved_code(self, question, error_df):
+        """Generate improved code after an error by using more explicit prompting"""
+        try:
+            error_type = error_df["Error Type"].iloc[0]
+            error_message = error_df["Error Message"].iloc[0]
+            failed_code = error_df["Code"].iloc[0]
+
+            # Create a more detailed prompt with the error information
+            improved_prompt = f"""
+            You are an expert data analyst debugging a failed pandas query.
+
+            TASK: Fix the Python code that failed to execute properly. The code needs to answer: "{question}"
+
+            ERROR INFORMATION:
+            - Error Type: {error_type}
+            - Error Message: {error_message}
+            - Failed Code:
+            ```python
+            {failed_code}
+            ```
+
+            DATASET INFORMATION:
+            - Available columns: {', '.join(self.df.columns)}
+            - Sample data (first row): {self.df.iloc[0].to_dict()}
+
+            REQUIREMENTS:
+            1. Return ONLY the fixed code with NO explanations
+            2. Ensure the code is syntactically correct Python
+            3. Handle the specific error mentioned above
+            4. Use ONLY the 'df' variable as input (do NOT import pandas or numpy)
+            5. Make sure the code returns a DataFrame object in a variable named 'result'
+            6. Be conservative with changes - only fix what's necessary to make the code work
+            7. IMPORTANT: The code must be READ-ONLY - do not modify the original dataframe
+            
+
+            FIXED CODE:
+            """
+
+            # Get improved code from LLM
+            improved_response = self.llm.invoke(improved_prompt)
+            improved_code = improved_response.content.strip()
+
+            # Extract code if it's wrapped in code blocks
+            if "```python" in improved_code:
+                improved_code = improved_code.split("```python")[1].split("```")[0].strip()
+            elif "```" in improved_code:
+                improved_code = improved_code.split("```")[1].split("```")[0].strip()
+
+            # Same cleanup as in _generate_pandas_code
+            improved_code = re.sub(r'import\s+[^;]+;?', '', improved_code)
+            improved_code = re.sub(r'from\s+[^;]+;?', '', improved_code)
+            improved_code = re.sub(r'print\([^)]*\)', '', improved_code)
+
+            # Remove any row limitations
+            # improved_code = re.sub(r'\.head\(\d*\)', '', improved_code)
+            # improved_code = re.sub(r'\.tail\(\d*\)', '', improved_code)
+
+            # Check for and remove any data modification functions - use more precise patterns
+            for forbidden_pattern in [
+                r'\.to_csv', r'\.to_excel', r'\.to_sql', r'\.to_pickle', r'\.to_hdf', r'\.to_feather',
+                r'\.to_parquet', r'\.to_json', r'\.to_html', r'\.to_latex', r'\.to_stata', r'\.to_gbq',
+                r'\.to_records', r'\.to_string', r'\.to_clipboard',
+                r'df\s*=\s', r'df\[\s*[\'\"]?\w+[\'\"]?\s*\]\s*=\s',  # More precise assignment patterns
+                r'\.drop\(', r'\.insert\(', r'\.replace\(', r'\.update\(', r'\.pop\('
+            ]:
+                # Check if forbidden pattern is in the code
+                if re.search(forbidden_pattern, improved_code):
+                    self.logger.warning(f"Removing forbidden operation from improved code: {forbidden_pattern}")
+                    # For operations that modify df directly, we'll just comment them out
+                    improved_code = re.sub(f"(.*)({forbidden_pattern}.*)", r"# \1\2", improved_code)
+
+            # If result assignment is commented out, uncomment it
+            if re.search(r'^\s*#\s*result\s*=', improved_code, re.MULTILINE):
+                improved_code = re.sub(r'^\s*#\s*(result\s*=.*)', r'\1', improved_code, flags=re.MULTILINE)
+
+            # Ensure there's a result assignment somewhere
+            if not re.search(r'result\s*=', improved_code):
+                self.logger.warning("No result assignment found, adding one")
+                # Find the last line that could produce a DataFrame and assign to result
+                lines = improved_code.strip().split('\n')
+                for i in range(len(lines) - 1, -1, -1):
+                    if not lines[i].strip().startswith('#') and 'df' in lines[i]:
+                        improved_code = f"result = {lines[i].strip()}"
+                        break
+
+            self.logger.info(f"Generated improved code: {improved_code}")
+            return improved_code
+
+        except Exception as e:
+            self.logger.error(f"Improved code generation error: {e}")
+            return None  # Fall back to original error
+
+    def query(self, question):
+        """
+        Process natural language query and return SQL-like tabular results
+        (view-only, with no record limit)
+
+        Args:
+            question (str): Natural language query about the data
+
+        Returns:
+            str: Formatted table result and query information
+        """
+        try:
+            self.logger.info(f"Processing query: {question}")
+
+            # Generate pandas code from the question
+            code = self._generate_pandas_code(question)
+
+            # Log the generated code (for debugging)
+            self.logger.info(f"Generated code: {code}")
+
+            # Execute the code
+            result = self._execute_query(code)
+
+            # Additional check: if result has error columns, try to improve the query
+            if isinstance(result, pd.DataFrame) and "Error Type" in result.columns:
+                self.logger.info("First attempt failed, trying with more robust prompting")
+
+                # Try with more robust prompting
+                improved_code = self._generate_improved_code(question, result)
+                if improved_code:
+                    result = self._execute_query(improved_code)
+
+            # Format as table
+            table_result = self._format_result_as_table(result)
+
+            return table_result
+
+        except Exception as e:
+            self.logger.error(f"Query processing error: {e}")
+            return f"Error processing query: {str(e)}"
+
+
+def main():
+    """Main function to run the View-Only Data Query Engine."""
+    print("\n" + "=" * 60)
+    print("🔍 View-Only Data Query Assistant")
+    print("=" * 60)
+
+    # Load environment variables
+    load_dotenv()
+
+    # Retrieve Google API key
+    google_api_key = os.getenv('GOOGLE_API_KEY')
+    if not google_api_key:
+        print("❌ Error: GOOGLE_API_KEY not found in .env file")
+        print("Please create a .env file with your Google AI API key as GOOGLE_API_KEY=your_key_here")
+        sys.exit(1)
+
+    # Prompt for file path
+    while True:
+        file_path = input("\n📂 Enter the path to your Excel or CSV file: ")
+
+        if not os.path.exists(file_path):
+            print(f"❌ Error: File '{file_path}' does not exist.")
+            continue
+
+        if not file_path.lower().endswith(('.xlsx', '.xls', '.csv')):
+            print("❌ Error: Unsupported file format. Please use .xlsx, .xls, or .csv")
+            continue
+
+        break
+
+    # Initialize query engine
+    print("\n🔍 Initializing View-Only Data Query Engine...")
+    print("Loading and analyzing your data...")
+
+    engine = ViewOnlyDataQueryEngine(
+        api_key=google_api_key,
+        file_path=file_path
+    )
+
+    if not engine.initialize():
+        print("❌ Initialization failed. Check logs for details.")
+        sys.exit(1)
+
+    print("\n✅ Data loaded and analyzed successfully!")
+    print(
+        f"📊 Ready to query {engine.schema_analysis['dataset']['rows']} rows and {engine.schema_analysis['dataset']['columns']} columns")
+
+    # Interactive query loop
+    print("\n💡 Type your questions in natural language. Results will appear in SQL-style tables.")
+    print("Type 'exit' to quit")
+    print("⚠️ This is a VIEW-ONLY interface - all modifications are prohibited")
+
+    while True:
+        try:
+            query = input("\nSQL> ")
+
+            if query.lower() in ['exit', 'quit', '\q']:
+                break
+
+            # Skip empty queries
+            if not query.strip():
+                continue
+
+            # Process query
+            result = engine.query(query)
+
+            # Print result
+            print("\n" + result + "\n")
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Operation cancelled.")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+
+    print("\n✅ Session ended. Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
